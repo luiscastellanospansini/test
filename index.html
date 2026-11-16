@@ -90,32 +90,104 @@ document.addEventListener('input',e=>{if(e.target.id==='search'){window.searchVa
 // Cloud sync v0.5: revision-controlled household snapshot; never embeds privileged credentials.
 (()=>{
  const CFG='household-cloud-config-v1'; const DEFAULT_CLOUD={url:'https://jsqbkaupqcccnegumxfo.supabase.co',key:'sb_publishable_mHCD1d0dvaPcbjZUE3JocQ_aBrKeNlz'}; let cfg;try{cfg={...DEFAULT_CLOUD,...JSON.parse(localStorage.getItem(CFG)||'{}')}}catch{cfg={...DEFAULT_CLOUD}}
- let client=null,household=null,revision=null,dirty=false,blocked=false,busy=false,timer=null,poll=null,editSeq=0;
+ let client=null,household=null,revision=null,dirty=false,blocked=false,busy=false,timer=null,poll=null,editSeq=0,base=null,conflict=null;
+ const HISTORY='household-finance-recovery-v1';
+ function checkpoint(reason, snapshot=window.cloudExport()){
+  try{const all=JSON.parse(localStorage.getItem(HISTORY)||'[]');all.unshift({at:new Date().toISOString(),reason,household,revision,state:structuredClone(snapshot)});localStorage.setItem(HISTORY,JSON.stringify(all.slice(0,12)))}catch(e){console.warn('Recovery checkpoint unavailable',e)}
+ }
+ function downloadBackup(snapshot,name){const blob=new Blob([JSON.stringify(snapshot,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+ const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
+ // Three-way merge: auto-merge only independently changed transaction IDs.
+ // All other changes (including budgets, categories and review status) require manual resolution.
+ function mergeDisjoint(ancestor,local,remote){
+  if(!ancestor||!local||!remote)return null;
+  const strip=s=>{const c=structuredClone(s);delete c.transactions;return c};
+  const aOther=strip(ancestor),lOther=strip(local),rOther=strip(remote);
+  if(!same(lOther,aOther)&&!same(rOther,aOther))return null;
+  const amap=new Map((ancestor.transactions||[]).map(t=>[t.id,t]));
+  const lmap=new Map((local.transactions||[]).map(t=>[t.id,t]));
+  const rmap=new Map((remote.transactions||[]).map(t=>[t.id,t]));
+  const result=new Map();
+  for(const id of new Set([...amap.keys(),...lmap.keys(),...rmap.keys()])){
+   const a=amap.get(id),l=lmap.get(id),r=rmap.get(id),lc=!same(l,a),rc=!same(r,a);
+   if(lc&&rc&&!same(l,r))return null;
+   const chosen=lc?l:r;
+   if(chosen!==undefined)result.set(id,chosen);
+  }
+  const merged=structuredClone(same(lOther,aOther)?remote:local);
+  merged.transactions=[...result.values()];return merged;
+ }
+ function setConflict(message){blocked=true;conflict=true;checkpoint('sync conflict — local edits preserved');msg(message+' Open Cloud Sync to resolve.');}
+
  const msg=(m)=>{window.cloudStatus=m;const el=document.getElementById('cloudIndicator');if(el)el.textContent=m;const st=document.getElementById('cloudMessage');if(st)st.textContent=m};
  const err=e=>e?.message||String(e);
  function init(){if(!cfg.url||!cfg.key||!window.supabase?.createClient)return false;try{client=window.supabase.createClient(cfg.url,cfg.key,{auth:{persistSession:true,autoRefreshToken:true}});return true}catch(e){msg('Configuration error: '+err(e));return false}}
  async function rpc(name,args={}){const {data,error}=await client.rpc(name,args);if(error)throw error;return data}
  async function session(){if(!client)return null;const {data,error}=await client.auth.getSession();if(error)throw error;return data.session}
  async function discover(){const {data,error}=await client.from('household_members').select('household_id,role').limit(10);if(error)throw error;return data||[]}
- async function pull(force=false){if(!household||busy||blocked&&!force)return;busy=true;try{const r=await rpc('hf_get_state',{p_household:household});if(!r)throw Error('Household not accessible');if(dirty&&!force){if(r.revision!==revision){blocked=true;msg('Sync conflict — local edits and cloud changes differ. Export backup, then resolve.');}return}if(force||revision===null||r.revision!==revision){window.cloudApply(r.state);revision=r.revision;dirty=false;blocked=false}msg('Cloud connected · synced revision '+revision)}catch(e){msg('Cloud read failed: '+err(e))}finally{busy=false}}
- async function push(){if(!household||!dirty||busy||blocked)return;busy=true;try{const sentSeq=editSeq;const result=await rpc('hf_save_state',{p_household:household,p_expected_revision:revision,p_state:window.cloudExport()});revision=result;dirty=editSeq!==sentSeq;msg(dirty?'Cloud connected · saving newer edits…':'Cloud connected · saved revision '+revision)}catch(e){if(/revision|conflict/i.test(err(e))){blocked=true;msg('Sync conflict — export local backup before resolving.')}else msg('Cloud sync pending: '+err(e))}finally{busy=false;if(dirty&&!blocked)setTimeout(push,2500)}}
- window.cloudChanged=()=>{if(!household)return;editSeq++;dirty=true;msg('Unsynced changes · saving…');clearTimeout(timer);timer=setTimeout(push,850)};
+ async function pull(force=false){
+  if(!household||busy||(blocked&&!force))return;
+  busy=true;
+  try{
+   const r=await rpc('hf_get_state',{p_household:household});if(!r)throw Error('Household not accessible');
+   if(dirty){
+    if(r.revision!==revision){
+     const merged=mergeDisjoint(base,window.cloudExport(),r.state);
+     if(merged){checkpoint('before automatic merge');window.cloudApply(merged);base=structuredClone(r.state);revision=r.revision;dirty=true;msg('Independent changes merged · saving…')}
+     else setConflict('Sync conflict — overlapping edits');
+    }
+    return;
+   }
+   if(force||revision===null||r.revision!==revision){
+    checkpoint('before cloud refresh');window.cloudApply(r.state);revision=r.revision;base=structuredClone(r.state);dirty=false;blocked=false;conflict=null;
+   }
+   msg('Cloud connected · synced revision '+revision)
+  }catch(e){msg('Cloud read failed: '+err(e))}finally{busy=false;if(dirty&&!blocked)setTimeout(push,100)}
+ }
+ async function push(){
+  if(!household||!dirty||busy||blocked)return;busy=true;
+  try{
+   const sentSeq=editSeq,snapshot=window.cloudExport();
+   const result=await rpc('hf_save_state',{p_household:household,p_expected_revision:revision,p_state:snapshot});
+   revision=result;base=structuredClone(snapshot);dirty=editSeq!==sentSeq;
+   msg(dirty?'Cloud connected · saving newer edits…':'Cloud connected · saved revision '+revision)
+  }catch(e){
+   if(/revision|conflict/i.test(err(e))){setConflict('Sync conflict — cloud revision changed')}
+   else msg('Cloud sync pending: '+err(e))
+  }finally{busy=false;if(dirty&&!blocked)setTimeout(push,2500)}
+ }
+ window.cloudChanged=()=>{if(!household)return;editSeq++;dirty=true;checkpoint('unsynced local edit');msg(blocked?'Sync conflict — local changes preserved':'Unsynced changes · saving…');if(!blocked){clearTimeout(timer);timer=setTimeout(push,850)}};
  const field=(label,id,type='text',val='')=>`<label>${label}<input class="field" id="${id}" type="${type}" value="${String(val).replace(/&/g,'&amp;').replace(/"/g,'&quot;')}" autocomplete="off"></label>`;
  window.cloudOpen=async()=>{
   const logged=await session().catch(()=>null);
-  modal(`<h2>Shared household cloud</h2><p>Supabase is preconfigured. Sign up or sign in, then create or join your household. Never enter a service-role key.</p><div class="formgrid">${field('Supabase project URL','hfUrl','url',cfg.url||'')}${field('Public anon / publishable key','hfKey','text',cfg.key||'')}${field('Email','hfEmail','email',logged?.user?.email||'')}${field('Password (sign up / sign in)','hfPassword','password')}</div><div class="rowactions section"><button class="btn alt" id="hfConfigure">Save connection</button><button class="btn" id="hfSignup">Sign up</button><button class="btn" id="hfSignin">Sign in</button><button class="btn alt" id="hfSignout">Sign out</button></div><div class="section"><p id="hfAuth">${logged?'Signed in as '+logged.user.email:'Not signed in'}</p></div><div class="formgrid">${field('New household name','hfHouse','text','Our household')}${field('Invitation code','hfInvite')}</div><div class="rowactions section"><button class="btn" id="hfCreate">Create household from local data</button><button class="btn alt" id="hfJoin">Join household</button><button class="btn alt" id="hfInviteBtn">Generate invite code</button></div><div class="section"><p>Sync status: <span id="cloudMessage">${window.cloudStatus||'Local only'}</span></p><div class="rowactions"><button class="btn alt" id="hfPull">Refresh from cloud</button><button class="btn alt" id="hfRecover">Discard local changes and use cloud</button><button class="btn alt" id="hfBackup">Export local backup</button></div></div><div class="actions"><button class="btn alt" id="hfClose">Close</button></div>`);
+  modal(`<h2>Shared household cloud · v1.0</h2><p>Supabase is preconfigured. Sign up or sign in, then create or join your household. Never enter a service-role key.</p><div class="formgrid">${field('Supabase project URL','hfUrl','url',cfg.url||'')}${field('Public anon / publishable key','hfKey','text',cfg.key||'')}${field('Email','hfEmail','email',logged?.user?.email||'')}${field('Password (sign up / sign in)','hfPassword','password')}</div><div class="rowactions section"><button class="btn alt" id="hfConfigure">Save connection</button><button class="btn" id="hfSignup">Sign up</button><button class="btn" id="hfSignin">Sign in</button><button class="btn alt" id="hfSignout">Sign out</button></div><div class="section"><p id="hfAuth">${logged?'Signed in as '+logged.user.email:'Not signed in'}</p></div><div class="formgrid">${field('New household name','hfHouse','text','Our household')}${field('Invitation code','hfInvite')}</div><div class="rowactions section"><button class="btn" id="hfCreate">Create household from local data</button><button class="btn alt" id="hfJoin">Join household</button><button class="btn alt" id="hfInviteBtn">Generate invite code</button></div><div class="section"><p>Sync status: <span id="cloudMessage">${window.cloudStatus||'Local only'}</span></p><div class="rowactions"><button class="btn alt" id="hfPull">Refresh from cloud</button><button class="btn alt" id="hfRecover">Discard local changes and use cloud</button><button class="btn alt" id="hfBackup">Export local backup</button><button class="btn alt" id="hfHistory">Recovery history</button><button class="btn alt" id="hfResolve">Resolve conflict</button></div><p class="muted">Automatic merging is limited to non-overlapping transaction edits. Other concurrent changes require review. This browser keeps up to 12 local recovery checkpoints.</p></div><div class="actions"><button class="btn alt" id="hfClose">Close</button></div>`);
   const $=id=>document.getElementById(id);const notify=t=>{msg(t);$('hfAuth').textContent=t};
   $('hfClose').onclick=close;
   $('hfConfigure').onclick=()=>{cfg={url:$('hfUrl').value.trim().replace(/\/$/,''),key:$('hfKey').value.trim()};localStorage.setItem(CFG,JSON.stringify(cfg));init();notify('Connection configured. Sign in to continue.')};
   $('hfSignup').onclick=async()=>{try{if(!client)throw Error('Cloud connection unavailable');const {data,error}=await client.auth.signUp({email:$('hfEmail').value.trim(),password:$('hfPassword').value});if(error)throw error;notify(data.session?'Signed up and authenticated.':'Check email for verification, then sign in.')}catch(e){notify(err(e))}};
-  $('hfSignin').onclick=async()=>{try{if(!client)throw Error('Cloud connection unavailable');const {error}=await client.auth.signInWithPassword({email:$('hfEmail').value.trim(),password:$('hfPassword').value});if(error)throw error;const hs=await discover();if(hs.length===1){household=hs[0].household_id;revision=null;dirty=false;blocked=false;await pull(true)}notify('Signed in'+(household?' · household connected':''))}catch(e){notify(err(e))}};
-  $('hfSignout').onclick=async()=>{if(client)await client.auth.signOut();household=null;revision=null;dirty=false;blocked=false;clearInterval(poll);notify('Signed out. Local data remains on this browser.')};
-  $('hfCreate').onclick=async()=>{try{if(!await session())throw Error('Sign in first');if(!confirm('Create a new household using the CURRENT local data? Do not do this if you intend to join an existing household.'))return;const result=await rpc('hf_create_household',{p_name:$('hfHouse').value.trim(),p_state:window.cloudExport()});household=result;revision=0;dirty=false;blocked=false;notify('Household created · synced revision 0');startPoll()}catch(e){notify(err(e))}};
-  $('hfJoin').onclick=async()=>{try{if(!await session())throw Error('Sign in first');if(!confirm('Joining will replace this browser’s current app data with the household cloud data. Export a backup first if needed.'))return;household=await rpc('hf_join_household',{p_code:$('hfInvite').value.trim()});revision=null;dirty=false;blocked=false;await pull(true);notify('Joined household · cloud data loaded');startPoll()}catch(e){notify(err(e))}};
+  $('hfSignin').onclick=async()=>{try{if(!client)throw Error('Cloud connection unavailable');const {error}=await client.auth.signInWithPassword({email:$('hfEmail').value.trim(),password:$('hfPassword').value});if(error)throw error;const hs=await discover();if(hs.length===1){household=hs[0].household_id;revision=null;base=null;dirty=false;blocked=false;await pull(true)}notify('Signed in'+(household?' · household connected':''))}catch(e){notify(err(e))}};
+  $('hfSignout').onclick=async()=>{if(client)await client.auth.signOut();household=null;revision=null;base=null;dirty=false;blocked=false;clearInterval(poll);notify('Signed out. Local data remains on this browser.')};
+  $('hfCreate').onclick=async()=>{try{if(!await session())throw Error('Sign in first');if(!confirm('Create a new household using the CURRENT local data? Do not do this if you intend to join an existing household.'))return;const result=await rpc('hf_create_household',{p_name:$('hfHouse').value.trim(),p_state:window.cloudExport()});household=result;revision=0;base=structuredClone(window.cloudExport());dirty=false;blocked=false;notify('Household created · synced revision 0');startPoll()}catch(e){notify(err(e))}};
+  $('hfJoin').onclick=async()=>{try{if(!await session())throw Error('Sign in first');if(!confirm('Joining will replace this browser’s current app data with the household cloud data. Export a backup first if needed.'))return;household=await rpc('hf_join_household',{p_code:$('hfInvite').value.trim()});revision=null;base=null;dirty=false;blocked=false;await pull(true);notify('Joined household · cloud data loaded');startPoll()}catch(e){notify(err(e))}};
   $('hfInviteBtn').onclick=async()=>{try{if(!household)throw Error('Connect a household first');const code=await rpc('hf_create_invite',{p_household:household});$('hfInvite').value=code;notify('Invite generated. Share the code privately; expires in 24 hours and can be used once.')}catch(e){notify(err(e))}};
   $('hfPull').onclick=()=>pull();
-  $('hfRecover').onclick=async()=>{if(!confirm('Discard ALL unsynced local changes and replace them with cloud data? Export a backup first.'))return;blocked=false;dirty=false;revision=null;await pull(true)};
-  $('hfBackup').onclick=()=>{const blob=new Blob([JSON.stringify(window.cloudExport(),null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='household-local-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+  $('hfRecover').onclick=async()=>{if(!confirm('Replace local data with cloud data? A recovery checkpoint will be kept on this browser.'))return;checkpoint('before manual cloud recovery');blocked=false;dirty=false;conflict=null;revision=null;await pull(true)};
+  $('hfHistory').onclick=()=>{let items=[];try{items=JSON.parse(localStorage.getItem(HISTORY)||'[]')}catch{};if(!items.length){notify('No recovery checkpoints yet.');return}modal(`<h2>Local recovery history</h2><p>Stored only in this browser. Export a checkpoint before restoring.</p>${items.map((x,i)=>`<div class="line"><span>${new Date(x.at).toLocaleString()} · ${x.reason.replace(/[<>]/g,'')}</span><button class="btn alt small" data-recovery="${i}">Export</button></div>`).join('')}<div class="actions"><button class="btn alt" id="hfHistoryClose">Close</button></div>`);document.getElementById('hfHistoryClose').onclick=close;document.querySelectorAll('[data-recovery]').forEach(b=>b.onclick=()=>{const x=items[Number(b.dataset.recovery)];downloadBackup(x.state,'household-recovery-'+x.at.slice(0,10)+'.json')})};
+  $('hfResolve').onclick=async()=>{
+   if(!household){notify('Connect a household first');return}
+   const r=await rpc('hf_get_state',{p_household:household}).catch(e=>{notify('Unable to load cloud version: '+err(e));return null});if(!r)return;
+   if(!dirty&&!blocked){notify('No pending local conflict.');return}
+   const local=window.cloudExport();checkpoint('before conflict resolution',local);
+   const merged=mergeDisjoint(base,local,r.state);
+   modal(`<h2>Resolve sync conflict</h2><p>Cloud revision ${r.revision}; local base revision ${revision}. Download your local copy before deciding.</p><p>${merged?'Independent transaction changes can be combined safely.':'Overlapping or non-transaction edits require manual review. Automatic merging is disabled.'}</p><div class="rowactions"><button class="btn alt" id="hfKeepLocal">Download local changes</button><button class="btn alt" id="hfKeepCloud">Download cloud version</button>${merged?'<button class="btn" id="hfMerge">Merge independent changes</button>':''}<button class="btn" id="hfUseCloud">Use cloud version</button></div><p class="muted">Using the cloud version discards unsynced edits from this device. Your local checkpoint is retained.</p><div class="actions"><button class="btn alt" id="hfCancelResolve">Cancel</button></div>`);
+   document.getElementById('hfKeepLocal').onclick=()=>downloadBackup(local,'household-local-conflict.json');
+   document.getElementById('hfKeepCloud').onclick=()=>downloadBackup(r.state,'household-cloud-conflict.json');
+   document.getElementById('hfCancelResolve').onclick=close;
+   document.getElementById('hfUseCloud').onclick=()=>{if(!confirm('Replace local changes with the cloud version?'))return;window.cloudApply(r.state);revision=r.revision;base=structuredClone(r.state);dirty=false;blocked=false;conflict=null;close();msg('Cloud version restored · revision '+revision)};
+   if(merged)document.getElementById('hfMerge').onclick=()=>{window.cloudApply(merged);revision=r.revision;base=structuredClone(r.state);dirty=true;blocked=false;conflict=null;close();msg('Merged · saving…');setTimeout(push,0)};
+  };
+
+  $('hfBackup').onclick=()=>downloadBackup(window.cloudExport(),'household-local-backup.json');
  };
  function startPoll(){clearInterval(poll);poll=setInterval(()=>{if(!dirty&&!blocked&&document.visibilityState==='visible')pull()},15000)}
  (async()=>{if(!init())return;try{if(!await session())return;const hs=await discover();if(hs.length===1){household=hs[0].household_id;await pull(true);startPoll()}else if(hs.length>1)msg('Multiple households found; choose one in a future release. No automatic sync enabled.')}catch(e){msg('Cloud connection error: '+err(e))}})();
