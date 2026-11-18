@@ -1,5 +1,5 @@
 // Household Finance v0.9 — online-first updates with offline fallback.
-const CACHE = 'household-finance-v09';
+const CACHE = 'household-finance-icon-v1';
 const OFFLINE_ASSETS = ['./index.html', './manifest.webmanifest', './icon.svg'];
 self.addEventListener('install', event => {
   event.waitUntil((async () => {
